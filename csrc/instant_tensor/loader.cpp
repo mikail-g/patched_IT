@@ -608,6 +608,121 @@ void* Loader::get_tensor_ptr(GetTensorArgs args) {
     return (char*)this->device_buffer + this->tensors[index].device_buffer_offset;
 }
 
+void Loader::stream_tensor(const StreamTensorArgs &args) {
+    // Read an oversize tensor (larger than the staging buffer) from the file
+    // into a caller-provided contiguous CUDA destination in bounded windows,
+    // reusing the asynchronous I/O and CUDA pipelines. Staging stays bounded
+    // because only `io_depth` host/device windows are in flight at once.
+    if (this->world_size > 1) {
+        print_and_throw(std::runtime_error(
+            "stream_tensor is not supported with world_size > 1 yet."));
+    }
+    if (args.file_index >= this->file_info.size()) {
+        print_and_throw(std::runtime_error("stream_tensor: invalid file index."));
+    }
+    if (args.size > args.dst_capacity) {
+        print_and_throw(std::runtime_error("stream_tensor: destination too small."));
+    }
+    if (args.size == 0) {
+        return;
+    }
+
+    const size_t depth = this->io_depth;
+    const size_t block = this->world_chunk_size;   // page-aligned read tile == one host window
+    const size_t align = this->rank_alignment;     // PAGE_SIZE
+
+    const size_t P0 = args.file_offset % align;         // tensor page-phase within the file
+    const size_t R0 = args.file_offset - P0;            // page-aligned tensor start
+    const size_t file_end = args.file_offset + args.size;
+
+    // Number of page-aligned tiles of `block` bytes covering [R0, file_end).
+    size_t num_windows = DIV_CEIL(file_end - R0, block);
+    size_t chunk_base = this->chunks.size();
+    this->chunks.resize(chunk_base + num_windows);
+
+    // Windows in flight is bounded by depth; track completion request ids per in-flight window.
+    std::vector<int> inflight(num_windows, -1);
+
+    auto reap_window = [&](size_t w) {
+        int req_id = inflight[w];
+        if (req_id < 0) return;
+        inflight[w] = -1;
+        // Waits for the cuda copy of this window to complete, freeing its
+        // host/device window and cuda event for reuse.
+        this->chunks[chunk_base + w].io_state.cuda_executor->reap(req_id);
+    };
+
+    for (size_t w = 0; w < num_windows; ++w) {
+        // Reuse the window that is `depth` ahead of us before posting anew.
+        if (w >= depth) {
+            reap_window(w - depth);
+        }
+
+        size_t read_start = R0 + w * block;
+        size_t avail = file_end - read_start;         // tensor bytes left in this tile
+        // Logical bytes this window must read. Clamp to the actual file size so
+        // the trailing (partial-page) window does not request bytes past EOF,
+        // which would make an O_DIRECT read return short forever.
+        size_t fs = this->file_info[args.file_index].size;
+        size_t rank_size = std::min({block, avail, fs - read_start});
+        // tensor destination offset of this tile's bytes
+        size_t t0 = (w == 0) ? 0 : (w * block - P0);
+        if (t0 >= args.size) continue;
+        size_t host_start = (P0 + t0) % block;        // tensor bytes start inside the host window
+        size_t slice_len = std::min(block - host_start, args.size - t0);
+        if (slice_len == 0 || rank_size == 0) continue;
+
+        size_t window_idx = w % depth;
+        size_t window_offset = window_idx * this->rank_chunk_size;
+
+        Chunk &chunk = this->chunks[chunk_base + w];
+        chunk = Chunk{};
+        chunk.size = rank_size;
+        chunk.file_index = args.file_index;
+        chunk.file_offset = read_start;
+        chunk.io_state.rank_size = rank_size;
+        chunk.io_state.rank_file_offset = read_start;
+        chunk.io_state.window_offset = window_offset;
+        chunk.io_state.bytes_completed = 0;
+        chunk.io_state.stream_dst = args.dst;
+        chunk.io_state.stream_dst_offset = t0;
+        chunk.io_state.stream_read_offset = host_start;
+        chunk.io_state.stream_size = slice_len;
+
+        void *rank_dst = (char*)args.dst + t0;
+        void *all_dst = rank_dst;
+        cudaEvent_t event = this->cuda_events[window_idx];
+        FileInfo &f = this->file_info[args.file_index];
+        ChunkIOParams params{(chunk_id_t)(chunk_base + w), chunk, f, window_idx,
+                             rank_dst, all_dst, event};
+
+        IORequest io_request = this->io_backend->post_read_chunk(params);
+
+        auto launch = [this, io_request, rank_dst, window_offset, host_start, slice_len, event]() {
+            if (!io_request.loaded_to_device) {
+                CUDA_CHECK(cudaMemcpyAsync(
+                    rank_dst,
+                    (char*)this->host_buffer + window_offset + host_start,
+                    slice_len, cudaMemcpyHostToDevice, this->cuda_stream));
+            }
+            CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
+        };
+        int completion_req_id = this->next_loader_task_id();
+        this->cuda_executor->submit(completion_req_id,
+            CUDAOperation{io_request, std::move(launch), event});
+        chunk.io_state.cuda_executor = this->cuda_executor.get();
+        chunk.io_state.cuda_request_id = completion_req_id;
+        inflight[w] = completion_req_id;
+    }
+
+    // Reap all remaining in-flight windows so the destination is fully written
+    // before returning; reaping each window's CUDA launch guarantees its copy
+    // and event have completed.
+    for (size_t w = 0; w < num_windows; ++w) {
+        reap_window(w);
+    }
+}
+
 std::any Loader::dispatch(const RPCRequest &m) {
     switch (m.op) {
         case OPEN:
@@ -616,9 +731,13 @@ std::any Loader::dispatch(const RPCRequest &m) {
         case CLOSE:
             this->close(std::any_cast<CloseArgs>(m.args));
             return std::any();
-        case GET_TENSOR_PTR:
+        case GET_TENSOR_PTR: {
             void* ret = this->get_tensor_ptr(std::any_cast<GetTensorArgs>(m.args));
             return std::any(ret);
+        }
+        case STREAM_TENSOR:
+            this->stream_tensor(std::any_cast<StreamTensorArgs>(m.args));
+            return std::any();
     }
     print_and_throw(std::runtime_error("Invalid operation"));
 }

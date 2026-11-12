@@ -77,6 +77,7 @@ enum Op {
     OPEN,
     CLOSE,
     GET_TENSOR_PTR,
+    STREAM_TENSOR,
 };
 
 struct OpenArgs {
@@ -107,6 +108,23 @@ struct CloseArgs {
 struct GetTensorArgs {
     size_t tensor_index;
     GetTensorArgs(size_t tensor_index) : tensor_index(tensor_index) {}
+};
+
+// Read a contiguous oversize tensor (larger than the staging buffer) from the
+// file into a caller-provided contiguous CUDA destination in bounded windows,
+// reusing the asynchronous I/O pipeline. The destination must be on the CUDA
+// device indicated at open time and have at least `size` bytes writable from
+// `dst`.
+struct StreamTensorArgs {
+    size_t file_index;
+    size_t file_offset; // absolute byte offset in the file
+    size_t size;        // total bytes to read
+    void *dst;          // base device pointer of the destination tensor
+    size_t dst_capacity; // writable bytes at dst
+    StreamTensorArgs(size_t file_index, size_t file_offset, size_t size,
+                     void *dst, size_t dst_capacity)
+        : file_index(file_index), file_offset(file_offset), size(size),
+          dst(dst), dst_capacity(dst_capacity) {}
 };
 
 struct FreeTensorArgs {
@@ -147,6 +165,13 @@ struct ChunkIOState {
     // Loader-owned handle for completion of IO, CUDA and optional NCCL work.
     CUDAExecutor* cuda_executor;
     int cuda_request_id;
+    // Streaming reads (oversize tensors) target a caller-provided destination
+    // instead of the shared ring buffer. When stream_dst is non-null,
+    // post_read_chunk copies the tensor bytes to that destination.
+    void *stream_dst = nullptr;
+    size_t stream_dst_offset = 0; // byte offset into stream_dst for this window
+    size_t stream_read_offset = 0; // offset within the host staging window to the tensor bytes
+    size_t stream_size = 0;        // number of tensor bytes delivered to stream_dst
 };
 
 struct IORequest {

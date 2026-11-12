@@ -602,6 +602,7 @@ class safe_open:
     def __init__(self, filename: Union[str, list[str]], framework: str,
             device: Union[int, str, torch.device], process_group=None, *,
             buffer_size: Optional[int]=None, chunk_size: Optional[int]=None, concurrency: Optional[int]=None, io_depth: Optional[int]=None,
+            max_buffer_size: Optional[int]=None,
             max_free_mem_usage: Optional[float]=None, load_now: bool = True, copy: bool = True, backend: BackendCandidates = None,
             tensor_filter: Optional[list[str]] = None,
             tensor_name_match_mode: Literal["exact", "glob", "regex"] = "glob"):
@@ -649,6 +650,20 @@ class safe_open:
             buffer_size, chunk_size, concurrency, io_depth,
             max_free_mem_usage, backend,
         )
+        # `max_buffer_size` caps the staging buffer at the given bound. It is
+        # an alias that takes precedence over / bounds `buffer_size`.
+        if max_buffer_size is not None:
+            if config.buffer_size is None:
+                config = OpenConfig(
+                    max_buffer_size, config.chunk_size, config.concurrency,
+                    config.io_depth, config.max_free_mem_usage, config.backend,
+                )
+            else:
+                config = OpenConfig(
+                    min(config.buffer_size, max_buffer_size),
+                    config.chunk_size, config.concurrency,
+                    config.io_depth, config.max_free_mem_usage, config.backend,
+                )
         self._determine_io_params(config)
 
         metadata_started_at = time.perf_counter()
@@ -1096,13 +1111,16 @@ class safe_open:
             tensor_size = get_tensor_size(shape, torch_dtype)
 
             if tensor_index in self._host_fallback_indices:
-                # The tensor is larger than the staging buffer; restore it into
-                # host memory and let the consumer slice and copy each shard to
-                # its destination. The returned tensor owns its memory.
-                tensor = self._read_host_tensor(
-                    name, metadata, torch_dtype, tensor_size,
-                    self._tensor_host_sources[tensor_index],
+                # The tensor is larger than the staging buffer; stream it
+                # directly into an owning CUDA destination using the
+                # asynchronous I/O pipeline, keeping the staging buffer bounded.
+                f_idx, file_offset = self._tensor_host_sources[tensor_index]
+                dst = torch.empty(tensor_size, dtype=torch.uint8, device=self.device)
+                _C.stream_tensor(
+                    self.loader_handle, f_idx, file_offset, tensor_size,
+                    dst.data_ptr(), tensor_size,
                 )
+                tensor = dst.view(torch_dtype).view(torch.Size(shape))
                 self.yielded_bytes += tensor_size
                 yield name, tensor
                 continue
@@ -1132,36 +1150,6 @@ class safe_open:
                 raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
             self.yielded_bytes += tensor_size
             yield name, tensor
-
-    def _read_host_tensor(self, name: str, metadata: dict, torch_dtype: torch.dtype,
-                          tensor_size: int, file_source: tuple[int, int]) -> torch.Tensor:
-        """Restore an oversize tensor into host memory.
-
-        Reads the fully contiguous byte range of a safetensors tensor directly
-        into a host ``bytearray`` and returns an owning CPU tensor of the
-        tensor's dtype and shape. Consumers can slice and ``copy_`` each shard
-        to its destination (e.g. a GPU parameter), which moves host data using
-        standard PyTorch semantics. Only called for tensors larger than the
-        staging buffer.
-        """
-        f_idx, file_offset = file_source
-        if tensor_size <= 0:
-            return torch.empty((), dtype=torch_dtype)
-        buffer = bytearray(tensor_size)
-        with open(self.filename[f_idx], "rb") as fh:
-            fh.seek(file_offset)
-            view = memoryview(buffer)
-            while view:
-                read = fh.readinto(view)
-                if read == 0:
-                    raise RuntimeError(
-                        f"Failed to read tensor {name!r}: unexpected end of file "
-                        f"{self.filename[f_idx]!r} at offset {file_offset}"
-                    )
-                view = view[read:]
-        tensor = torch.frombuffer(buffer, dtype=torch.uint8)
-        tensor = tensor.view(torch_dtype).view(torch.Size(metadata["shape"]))
-        return tensor.contiguous()
 
     def keys(self) -> list[str]:
         """Safetensors-compatible API: get the names of all tensors in the safetensors file(s).
