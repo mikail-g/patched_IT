@@ -439,7 +439,27 @@ class IOParamsTest(unittest.TestCase):
 
         self.assertEqual(loader.buffer_size, 3 * chunk_size)
 
-    def test_final_buffer_must_fit_device_memory_budget(self):
+    def test_final_buffer_is_capped_at_device_memory_budget(self):
+        # Auto-sized staging buffers must never exceed the device memory budget.
+        # Tensors larger than the capped buffer are restored through host memory
+        # instead of raising, so the loader remains usable for checkpoints whose
+        # largest tensor exceeds GPU memory.
+        chunk_size = 8 * 1024 * 1024
+        loader = self.determine_io_params(
+            selected_backend=impl.Backend.URING,
+            in_memory=False,
+            chunk_size=chunk_size,
+            io_depth=1,
+            free_bytes=2 * chunk_size,
+        )
+        loader.tensor_sizes = [3 * chunk_size]
+        loader.total_tensor_size = 3 * chunk_size
+
+        loader._finalize_buffer_size(None)
+        self.assertLessEqual(loader.buffer_size, 2 * chunk_size)
+
+    def test_explicit_buffer_must_fit_device_memory_budget(self):
+        # A user-specified buffer that is too large for the GPU is a real error.
         chunk_size = 8 * 1024 * 1024
         loader = self.determine_io_params(
             selected_backend=impl.Backend.URING,
@@ -454,7 +474,7 @@ class IOParamsTest(unittest.TestCase):
         with self.assertRaisesRegex(
             RuntimeError, "exceeds device memory budget",
         ):
-            loader._finalize_buffer_size(None)
+            loader._finalize_buffer_size(4 * chunk_size)
 
     def test_buffer_environment_is_resolved_once(self):
         chunk_size = 8 * 1024 * 1024

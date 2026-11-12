@@ -636,6 +636,7 @@ class safe_open:
         self.distributed_metadata_read = False
 
         self.ordered_tensor_metadatas = []
+        self._tensor_host_sources = []
         self.tensor_offsets = []
         self.tensor_keep = []
         self.iterated = False
@@ -672,6 +673,10 @@ class safe_open:
                 self.tensor_keep.append(keep)
                 if keep:
                     self.ordered_tensor_metadatas.append((name, metadata))
+                    # File location (file index, absolute file offset) in the
+                    # same order as ordered_tensor_metadatas, used for host
+                    # fallback of tensors larger than the staging buffer.
+                    self._tensor_host_sources.append((f_idx, metadata["data_offsets"][0] + tensor_offset))
         
 
         self.tensor_name_to_index = {k: i for i, (k, v) in enumerate(self.ordered_tensor_metadatas)}
@@ -876,16 +881,12 @@ class safe_open:
                 self.chunk_size, self.io_depth, self.world_size,
             )
             self.buffer_size = max(buffer_size_for_tensors, buffer_size_for_io)
+            # An auto-sized buffer must never exceed the device memory budget.
+            # Tensors larger than the buffer are restored through host memory.
+            if self.buffer_size > self.device_memory_budget:
+                self.buffer_size = self.device_memory_budget
         else:
             self.buffer_size = buffer_size
-            min_buffer_size = max(self.tensor_sizes, default=0)
-            if self.buffer_size < min_buffer_size:
-                warnings.warn(
-                    f"Enlarge buffer size from {self.buffer_size} to {min_buffer_size} to match the largest tensor size.",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
-                self.buffer_size = min_buffer_size
 
             max_buffer_size = max(
                 self.total_tensor_size,
@@ -902,9 +903,51 @@ class safe_open:
                 self.buffer_size = max_buffer_size
 
         if self.buffer_size > self.device_memory_budget:
-            raise RuntimeError(
-                f"buffer_size ({self.buffer_size} B) exceeds device memory "
-                f"budget ({self.device_memory_budget} B)"
+            # A user-specified buffer that is too large for the GPU is a real
+            # error; the auto-sized path above is already capped. Reflect the
+            # override rather than silently allocating beyond the budget.
+            if buffer_size is not None:
+                raise RuntimeError(
+                    f"buffer_size ({self.buffer_size} B) exceeds device memory "
+                    f"budget ({self.device_memory_budget} B)"
+                )
+
+        # Tensors larger than the staging buffer cannot live in the C++ GPU
+        # ring buffer (compute_layout rejects tensors > buffer_size). Restore
+        # them through host memory instead and let consumers slice and copy
+        # each shard to its destination. Mark them skipped in the C++ path so
+        # compute_layout never sees an oversize tensor.
+        self._host_fallback_indices = set()
+        cpp_tensor_index = 0
+        self.tensor_cpp_index = []
+        for size in self.tensor_sizes:
+            if size > self.buffer_size:
+                self._host_fallback_indices.add(len(self.tensor_cpp_index))
+                self.tensor_cpp_index.append(None)
+            else:
+                self.tensor_cpp_index.append(cpp_tensor_index)
+                cpp_tensor_index += 1
+        if self._host_fallback_indices:
+            # Exclude host-fallback tensors from the C++ GPU ring buffer so
+            # compute_layout never rejects an oversize tensor. Map kept-tensor
+            # positions back to their entries in self.tensor_keep (which covers
+            # all tensors across files) and clear them there.
+            # tensor_keep may be absent on a raw loader used only for buffer
+            # sizing; skip the mutation in that case.
+            kept_position = 0
+            for position, keep in enumerate(getattr(self, "tensor_keep", [])):
+                if not keep:
+                    continue
+                if kept_position in self._host_fallback_indices:
+                    self.tensor_keep[position] = False
+                kept_position += 1
+            warnings.warn(
+                f"{len(self._host_fallback_indices)} tensor(s) exceed the "
+                f"staging buffer size ({self.buffer_size} B) and will be "
+                "restored through host memory. Ensure sufficient RAM and let "
+                "consumers slice and move each shard to its destination.",
+                RuntimeWarning,
+                stacklevel=3,
             )
 
     def _read_metadata(self):
@@ -1051,7 +1094,20 @@ class safe_open:
                 raise ValueError(f"Unsupported safetensors dtype: {safetensors_dtype}")
 
             tensor_size = get_tensor_size(shape, torch_dtype)
-            dl_tensor = _C.get_dl_tensor(self.loader_handle, tensor_index, tensor_size) # always returns int8 tensor
+
+            if tensor_index in self._host_fallback_indices:
+                # The tensor is larger than the staging buffer; restore it into
+                # host memory and let the consumer slice and copy each shard to
+                # its destination. The returned tensor owns its memory.
+                tensor = self._read_host_tensor(
+                    name, metadata, torch_dtype, tensor_size,
+                    self._tensor_host_sources[tensor_index],
+                )
+                self.yielded_bytes += tensor_size
+                yield name, tensor
+                continue
+
+            dl_tensor = _C.get_dl_tensor(self.loader_handle, self.tensor_cpp_index[tensor_index], tensor_size) # always returns int8 tensor
             tensor_int8 = torch.from_dlpack(dl_tensor)
 
             required_alignment = torch.empty((), dtype=torch_dtype).element_size()
@@ -1076,6 +1132,36 @@ class safe_open:
                 raise ValueError(f"Tensor {name} address {tensor.data_ptr():#x} is not aligned to dtype {torch_dtype} size {tensor.element_size()}B")
             self.yielded_bytes += tensor_size
             yield name, tensor
+
+    def _read_host_tensor(self, name: str, metadata: dict, torch_dtype: torch.dtype,
+                          tensor_size: int, file_source: tuple[int, int]) -> torch.Tensor:
+        """Restore an oversize tensor into host memory.
+
+        Reads the fully contiguous byte range of a safetensors tensor directly
+        into a host ``bytearray`` and returns an owning CPU tensor of the
+        tensor's dtype and shape. Consumers can slice and ``copy_`` each shard
+        to its destination (e.g. a GPU parameter), which moves host data using
+        standard PyTorch semantics. Only called for tensors larger than the
+        staging buffer.
+        """
+        f_idx, file_offset = file_source
+        if tensor_size <= 0:
+            return torch.empty((), dtype=torch_dtype)
+        buffer = bytearray(tensor_size)
+        with open(self.filename[f_idx], "rb") as fh:
+            fh.seek(file_offset)
+            view = memoryview(buffer)
+            while view:
+                read = fh.readinto(view)
+                if read == 0:
+                    raise RuntimeError(
+                        f"Failed to read tensor {name!r}: unexpected end of file "
+                        f"{self.filename[f_idx]!r} at offset {file_offset}"
+                    )
+                view = view[read:]
+        tensor = torch.frombuffer(buffer, dtype=torch.uint8)
+        tensor = tensor.view(torch_dtype).view(torch.Size(metadata["shape"]))
+        return tensor.contiguous()
 
     def keys(self) -> list[str]:
         """Safetensors-compatible API: get the names of all tensors in the safetensors file(s).
