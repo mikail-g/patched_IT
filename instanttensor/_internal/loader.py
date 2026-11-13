@@ -5,6 +5,7 @@ import json
 import re
 import fnmatch
 import warnings
+import multiprocessing.shared_memory as shared_memory
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
@@ -645,6 +646,12 @@ class safe_open:
         self.copy = copy
         self._invalidated = False
         self.yielded_bytes = 0
+        # Shared host block used to materialize oversize (host-fallback) tensors
+        # once across all ranks. Lazily allocated on the first such tensor and
+        # released in __exit__. Keep it after self for correct teardown order.
+        self._oversize_shm = None
+        self._oversize_shm_tensor = None
+        self._oversize_shm_token = None
 
         config = resolve_open_config(
             buffer_size, chunk_size, concurrency, io_depth,
@@ -1044,12 +1051,85 @@ class safe_open:
         self.load_started_at = time.perf_counter()
         return self
 
+    def _rank_slice(self, tensor_size):
+        """Return (slice_start, slice_size) of this rank's contiguous slice of a
+        tensor of `tensor_size` bytes. Slices tile the tensor contiguously and
+        are balanced so the collective writes the full tensor exactly once."""
+        if self.world_size <= 1:
+            return 0, tensor_size
+        base = tensor_size // self.world_size
+        rem = tensor_size % self.world_size
+        slice_start = self.rank * base + min(self.rank, rem)
+        slice_size = base + (1 if self.rank < rem else 0)
+        return slice_start, slice_size
+
+    def _ensure_oversize_shm(self):
+        """Return a host torch.uint8 tensor aliasing a shared block big enough for
+        the largest oversize tensor. The block is created by rank 0 and mapped
+        by every rank; each rank streams only its own slice into it, so no rank
+        ever holds the full tensor in GPU memory."""
+        if self._oversize_shm is not None:
+            return self._oversize_shm_tensor
+
+        max_oversize = max(
+            self.tensor_sizes[i] for i in self._host_fallback_indices)
+        # All ranks map ONE shared block (the same physical segment), so its name
+        # must be identical across processes. Derive a token from rank 0 and
+        # broadcast it; os.getpid() would differ across workers and cannot be used.
+        group = self.process_group if self.process_group is not None else None
+        if getattr(self, "_oversize_shm_token", None) is None:
+            token = os.urandom(8).hex() if self.rank == 0 else None
+            if group is not None and self.world_size > 1:
+                token_list = [token]
+                dist.broadcast_object_list(token_list, src=0, group=group)
+                token = token_list[0]
+            else:
+                token = "single"
+            self._oversize_shm_token = token
+        shm_name = f"instanttensor_{self._oversize_shm_token}_oversize"
+        # Rank 0 creates; other ranks wait/retry until it exists, then they open.
+        if self.rank == 0:
+            shm = shared_memory.SharedMemory(create=True, size=max_oversize,
+                                             name=shm_name)
+            self._oversize_shm = shm
+        else:
+            for _ in range(10000):
+                try:
+                    self._oversize_shm = shared_memory.SharedMemory(
+                        create=False, name=shm_name)
+                    break
+                except FileNotFoundError:
+                    time.sleep(0.001)
+            else:
+                raise RuntimeError(
+                    f"rank {self.rank} timed out opening shared-memory block "
+                    f"{shm_name} for host-fallback tensors")
+        # All ranks map it before any rank streams a slice.
+        if group is not None and self.world_size > 1:
+            dist.barrier(group)
+        self._oversize_shm_tensor = torch.frombuffer(
+            self._oversize_shm.buf, dtype=torch.uint8)
+        debug_log("oversize shared block %s = %d B", shm_name, max_oversize)
+        return self._oversize_shm_tensor
+
+    def _release_oversize_shm(self):
+        if self._oversize_shm is None:
+            return
+        self._oversize_shm_tensor = None
+        if self.rank == 0:
+            self._oversize_shm.close()
+            self._oversize_shm.unlink()
+        else:
+            self._oversize_shm.close()
+        self._oversize_shm = None
+
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         stream = torch.cuda.current_stream()
         stream.synchronize() # make sure all the data transfer is done
         load_finished_at = time.perf_counter()
         self._invalidated = True
         _C.close(self.loader_handle)
+        self._release_oversize_shm()
         closed_at = time.perf_counter()
         if env_debug():
             total_seconds = closed_at - self.created_at
@@ -1111,16 +1191,23 @@ class safe_open:
             tensor_size = get_tensor_size(shape, torch_dtype)
 
             if tensor_index in self._host_fallback_indices:
-                # The tensor is larger than the staging buffer; stream it
-                # directly into an owning CUDA destination using the
-                # asynchronous I/O pipeline, keeping the staging buffer bounded.
+                # The tensor is larger than the staging buffer (and, in multi-GPU
+                # mode, cannot necessarily fit in any single rank's GPU memory).
+                # Materialize it once across all ranks in a shared HOST block:
+                # each rank streams only its own contiguous slice into the block,
+                # then all ranks barrier before slicing the full tensor (as host
+                # memory) and placing shards on GPU. This keeps the staging buffer
+                # bounded and never holds the whole tensor in GPU RAM.
                 f_idx, file_offset = self._tensor_host_sources[tensor_index]
-                dst = torch.empty(tensor_size, dtype=torch.uint8, device=self.device)
+                src = self._ensure_oversize_shm()
+                slice_start, slice_size = self._rank_slice(tensor_size)
                 _C.stream_tensor(
-                    self.loader_handle, f_idx, file_offset, tensor_size,
-                    dst.data_ptr(), tensor_size,
+                    self.loader_handle, f_idx, file_offset, slice_start,
+                    slice_size, src.data_ptr(), tensor_size,
                 )
-                tensor = dst.view(torch_dtype).view(torch.Size(shape))
+                if self.process_group is not None and self.world_size > 1:
+                    dist.barrier(self.process_group)
+                tensor = src[:tensor_size].view(torch_dtype).view(torch.Size(shape))
                 self.yielded_bytes += tensor_size
                 yield name, tensor
                 continue

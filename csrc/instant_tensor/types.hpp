@@ -110,21 +110,28 @@ struct GetTensorArgs {
     GetTensorArgs(size_t tensor_index) : tensor_index(tensor_index) {}
 };
 
-// Read a contiguous oversize tensor (larger than the staging buffer) from the
-// file into a caller-provided contiguous CUDA destination in bounded windows,
-// reusing the asynchronous I/O pipeline. The destination must be on the CUDA
-// device indicated at open time and have at least `size` bytes writable from
-// `dst`.
+// Stream a contiguous slice of an oversize tensor (larger than the staging
+// buffer) from the file into a caller-provided destination in bounded host
+// windows, reusing the asynchronous I/O pipeline. The destination `dst` is a
+// HOST memory block (e.g. a shared-memory region) covering the WHOLE tensor;
+// this rank writes only its own disjoint [slice_offset, slice_offset+slice_size)
+// range. Across all ranks the shared block then holds the full tensor, so a
+// tensor that cannot fit in per-rank GPU memory can still be materialized once
+// in shared RAM and sliced by consumers (e.g. vLLM) for GPU placement.
+//
+// Only host-staging backends (aio/uring/mmap) are supported here, because the
+// bytes must be moved into host `dst`.
 struct StreamTensorArgs {
     size_t file_index;
-    size_t file_offset; // absolute byte offset in the file
-    size_t size;        // total bytes to read
-    void *dst;          // base device pointer of the destination tensor
-    size_t dst_capacity; // writable bytes at dst
-    StreamTensorArgs(size_t file_index, size_t file_offset, size_t size,
-                     void *dst, size_t dst_capacity)
-        : file_index(file_index), file_offset(file_offset), size(size),
-          dst(dst), dst_capacity(dst_capacity) {}
+    size_t file_offset;  // absolute byte offset of the tensor base in the file
+    size_t slice_offset; // byte offset *within the tensor* where THIS rank's slice starts
+    size_t slice_size;   // number of tensor bytes written by THIS rank
+    void *dst;           // base host pointer of the destination (full tensor)
+    size_t dst_capacity; // writable bytes at dst (>= file_offset-relative size)
+    StreamTensorArgs(size_t file_index, size_t file_offset, size_t slice_offset,
+                     size_t slice_size, void *dst, size_t dst_capacity)
+        : file_index(file_index), file_offset(file_offset), slice_offset(slice_offset),
+          slice_size(slice_size), dst(dst), dst_capacity(dst_capacity) {}
 };
 
 struct FreeTensorArgs {

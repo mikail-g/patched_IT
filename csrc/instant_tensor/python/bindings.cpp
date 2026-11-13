@@ -113,10 +113,11 @@ public:
     }
 
     void stream_tensor(int loader_handle, size_t file_index, size_t file_offset,
-                       size_t size, uint64_t dst, size_t dst_capacity) {
+                       size_t slice_offset, size_t slice_size, uint64_t dst,
+                       size_t dst_capacity) {
         int req_id = this->call(loader_handle, STREAM_TENSOR,
-            std::make_any<StreamTensorArgs>(file_index, file_offset, size,
-                reinterpret_cast<void*>(dst), dst_capacity));
+            std::make_any<StreamTensorArgs>(file_index, file_offset, slice_offset,
+                slice_size, reinterpret_cast<void*>(dst), dst_capacity));
         this->get_result(loader_handle, req_id);
     }
 };
@@ -157,11 +158,13 @@ py::object get_dl_tensor(int loader_handle, int tensor_index, size_t size) {
 }
 
 void stream_tensor(int loader_handle, size_t file_index, size_t file_offset,
-                   size_t size, uint64_t dst, size_t dst_capacity) {
+                   size_t slice_offset, size_t slice_size, uint64_t dst,
+                   size_t dst_capacity) {
     if(!manager) {
         print_and_throw(std::runtime_error("Internal error: manager is not initialized"));
     }
-    manager->stream_tensor(loader_handle, file_index, file_offset, size, dst, dst_capacity);
+    manager->stream_tensor(loader_handle, file_index, file_offset, slice_offset,
+        slice_size, dst, dst_capacity);
 }
 
 BackendStatus backend_status(int backend) {
@@ -255,11 +258,12 @@ PYBIND11_MODULE(_C, m) {
           pybind11::arg("size"));
 
     m.def("stream_tensor", &instanttensor::stream_tensor,
-          "Stream an oversize tensor into a caller-provided CUDA destination",
+          "Stream THIS rank's slice of an oversize tensor into a host dst",
           pybind11::arg("loader_handle"),
           pybind11::arg("file_index"),
           pybind11::arg("file_offset"),
-          pybind11::arg("size"),
+          pybind11::arg("slice_offset"),
+          pybind11::arg("slice_size"),
           pybind11::arg("dst"),
           pybind11::arg("dst_capacity"));
 
