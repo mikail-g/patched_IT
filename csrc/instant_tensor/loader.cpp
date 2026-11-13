@@ -2,6 +2,7 @@
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <unistd.h>
 
 namespace instanttensor {
 namespace {
@@ -609,6 +610,9 @@ void* Loader::get_tensor_ptr(GetTensorArgs args) {
 }
 
 void Loader::stream_tensor(const StreamTensorArgs &args) {
+    const bool dbg = getenv("INSTANTTENSOR_DEBUG") != nullptr;
+    if (dbg) fprintf(stderr, "[ST rank=%d] stream_tensor enter file_index=%zu file_offset=%zu slice_offset=%zu slice_size=%zu dst_capacity=%zu\n",
+                     this->rank, args.file_index, args.file_offset, args.slice_offset, args.slice_size, args.dst_capacity);
     // Read THIS rank's contiguous slice of an oversize tensor from the file
     // into a caller-provided HOST destination (e.g. a shared-memory block
     // covering the whole tensor) in bounded page-aligned windows. Only
@@ -652,83 +656,49 @@ void Loader::stream_tensor(const StreamTensorArgs &args) {
     const size_t X1 = ROUND_UP(slice_file_hi, align);
     const size_t num_windows = DIV_CEIL(X1 - X0, tile);
 
-    size_t chunk_base = this->chunks.size();
-    this->chunks.resize(chunk_base + num_windows);
-
-    // In-flight windows are bounded by depth; track io thread request ids.
-    std::vector<int> inflight(num_windows, -1);
-
-    // Wait for a window's read to finish, then copy its slice bytes into `dst`
-    // (host -> host) at the correct offset and free the staging window.
-    auto reap_window = [&](size_t w) {
-        int req_id = inflight[w];
-        if (req_id < 0) return;
-        inflight[w] = -1;
-        Chunk &chunk = this->chunks[chunk_base + w];
-        size_t X = chunk.io_state.rank_file_offset;
-        // Wait for the I/O read of this window to complete.
-        this->io_thread->reap(req_id);
-
-        size_t over_start = std::max(X, slice_file_lo);
-        size_t over_end = std::min({X + tile, slice_file_hi, fs});
-        if (over_end > over_start) {
-            // `dst` bytes are indexed relative to the tensor base (file_offset).
-            size_t dst_ofs = over_start - args.file_offset;
-            size_t staging_ofs = chunk.io_state.window_offset + (over_start - X);
-            memcpy((char*)args.dst + dst_ofs,
-                   (char*)this->host_buffer + staging_ofs,
-                   over_end - over_start);
-        }
-    };
-
+    // This rank reads its slice with bounded synchronous `pread()` calls on the
+    // loader thread, one page-aligned window at a time, then copies the slice
+    // bytes (host -> host) into `dst`. Because the reads never go through the
+    // shared asynchronous IO thread / io_uring ring used by the ring-buffer path,
+    // they cannot stall against that path under a multi-process load, which is what
+    // made the earlier io_thread-based implementation hang. The staging buffer stays
+    // bounded (at most `tile` bytes in flight) regardless of the tensor size.
+    int fd = this->file_info[args.file_index].fd;
+    char *slot = (char*)this->host_buffer;
+    size_t windows_read = 0;
     for (size_t w = 0; w < num_windows; ++w) {
-        // Reuse the window that is `depth` ahead of us before posting anew.
-        if (w >= depth) {
-            reap_window(w - depth);
-        }
-
         size_t X = X0 + w * tile;
         if (X >= slice_file_hi) continue;              // past the slice
         size_t over_start = std::max(X, slice_file_lo);
         size_t over_end = std::min({X + tile, slice_file_hi, fs});
         if (over_end <= over_start) continue;          // no slice bytes in this window
 
-        // Read a full page-aligned window starting at X (within the file), so
-        // every window read satisfies O_DIRECT alignment regardless of the
-        // slice's page-phase. Bytes outside [slice_file_lo, slice_file_hi) in
-        // the window are read but discarded during the copy to `dst`.
         size_t read_len = std::min(tile, fs - X);
         if (read_len == 0) continue;
-
-        size_t window_idx = w % depth;
-        size_t window_offset = window_idx * this->rank_chunk_size;
-
-        Chunk &chunk = this->chunks[chunk_base + w];
-        chunk = Chunk{};
-        chunk.size = read_len;
-        chunk.file_index = args.file_index;
-        chunk.file_offset = X;
-        chunk.io_state.rank_size = read_len;
-        chunk.io_state.rank_file_offset = X; // page aligned
-        chunk.io_state.window_offset = window_offset;
-        chunk.io_state.bytes_completed = 0;
-
-        FileInfo &f = this->file_info[args.file_index];
-        // rank_dst/all_dst are unused by the host copy path; keep placeholders
-        // so backends that touch them (device-direct) are not dereferenced.
-        cudaEvent_t event = nullptr;
-        ChunkIOParams params{(chunk_id_t)(chunk_base + w), chunk, f, window_idx,
-                             nullptr, nullptr, event};
-        IORequest io_request = this->io_backend->post_read_chunk(params);
-        // The io thread request id is the wait handle for the read completion.
-        inflight[w] = io_request.wait_handle;
+        // O_DIRECT reads need an aligned length; the trailing partial window is
+        // rounded up, and the memcpy below clips to `over_end`, so a short read
+        // at EOF is harmless.
+        size_t read_len_aligned = ROUND_UP(read_len, align);
+        if (read_len_aligned == 0) continue;
+        if (dbg) fprintf(stderr, "[ST rank=%d] pread w=%zu X=%zu len=%zu\n", this->rank, w, X, read_len);
+        ssize_t got = ::pread(fd, slot, read_len_aligned, (off_t)X);
+        if (got < 0) {
+            print_and_throw(std::runtime_error(
+                "stream_tensor: pread failed at file offset " + std::to_string(X) +
+                ": " + std::string(strerror(errno))));
+        }
+        if ((size_t)got < (over_end - over_start)) {
+            throw std::runtime_error(
+                "stream_tensor: short read at file offset " + std::to_string(X));
+        }
+        size_t dst_ofs = over_start - args.file_offset;
+        size_t staging_ofs = over_start - X;
+        memcpy((char*)args.dst + dst_ofs, slot + staging_ofs,
+               over_end - over_start);
+        ++windows_read;
     }
-
-    // Reap all remaining windows so the destination slice is fully written
-    // before returning.
-    for (size_t w = 0; w < num_windows; ++w) {
-        reap_window(w);
-    }
+    (void)depth;
+    if (dbg) fprintf(stderr, "[ST rank=%d] stream_tensor EXIT n=%zu\n", this->rank, windows_read);
 }
 
 std::any Loader::dispatch(const RPCRequest &m) {

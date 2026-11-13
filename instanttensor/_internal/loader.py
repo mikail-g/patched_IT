@@ -652,7 +652,13 @@ class safe_open:
         self._oversize_shm = None
         self._oversize_shm_tensor = None
         self._oversize_shm_token = None
+        self._oversize_step = 0  # count of oversize tensors fully written by this rank
+        self._oversize_consume_step = 0  # count of oversize tensors fully consumed
+        self._oversize_seen = False  # whether this rank has processed an oversize tensor
+        self._oversize_barrier_base = None
+        self._oversize_consume_base = None
 
+        debug_log(f"[DGN rank={getattr(self,'rank','?')} pid={os.getpid()}] safe_open.__init__ start (module {__file__})")
         config = resolve_open_config(
             buffer_size, chunk_size, concurrency, io_depth,
             max_free_mem_usage, backend,
@@ -672,10 +678,12 @@ class safe_open:
                     config.io_depth, config.max_free_mem_usage, config.backend,
                 )
         self._determine_io_params(config)
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] __init__: after _determine_io_params; calling _read_metadata")
 
         metadata_started_at = time.perf_counter()
 
         meta_read_results = self._read_metadata()
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] __init__: _read_metadata done")
 
         self.file_metadata = None
         for f_idx, f in enumerate(self.filename):
@@ -755,9 +763,11 @@ class safe_open:
             max_free_mem_usage = 0.5
 
         resources_started_at = time.perf_counter()
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _determine_io_params: calling negotiate_resources")
         resources = negotiate_resources(self.process_group, device=self.device,
                                         max_free_mem_usage=max_free_mem_usage)
         self.resources_seconds = time.perf_counter() - resources_started_at
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _determine_io_params: negotiate_resources done")
         self.host_memory_budget = resources.avail_mem
         cpus = resources.avail_cpus
         avail_bytes = resources.avail_device_mem
@@ -765,10 +775,12 @@ class safe_open:
                   cpus, resources.avail_mem, avail_bytes)
 
         backend_started_at = time.perf_counter()
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _determine_io_params: calling select_distributed_backend")
         backend = select_distributed_backend(
             backend_candidates, self.device, self.process_group,
         )
         self.backend_seconds = time.perf_counter() - backend_started_at
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _determine_io_params: select_distributed_backend done -> {backend.name}")
         self.device_memory_budget = avail_bytes
 
         if concurrency is not None:
@@ -971,6 +983,7 @@ class safe_open:
                 RuntimeWarning,
                 stacklevel=3,
             )
+        debug_log(f"[DGN rank={getattr(self,'rank','?')} pid={os.getpid()}] finalize_buffer: buffer_size={self.buffer_size} n_oversize={len(self._host_fallback_indices)} total={self.total_tensor_size}")
 
     def _read_metadata(self):
         meta_read_threads = []
@@ -1027,7 +1040,9 @@ class safe_open:
         rows = torch.empty((self.world_size, len(values)), dtype=torch.int64, device=self.device)
         record = rows[self.rank]
         record.copy_(torch.tensor(values, dtype=torch.int64, device=self.device))
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] check_open_params: about to all_gather rows={rows.shape}")
         dist.all_gather_into_tensor(rows.view(-1), record, group=self.process_group)
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] check_open_params: all_gather done")
         records = rows.tolist()
         fields = [('page_size', 0, 1), ('buffer_size', 1, 2), ('chunk_size', 2, 3),
                   ('concurrency', 3, 4), ('io_depth', 4, 5), ('backend', 5, 6),
@@ -1039,11 +1054,14 @@ class safe_open:
 
     def _open(self):
         open_started_at = time.perf_counter()
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _open: getting nccl comm ptr")
         nccl_communicator = self.process_group._get_backend(self.device)._comm_ptr() if self.process_group is not None else 0
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _open: calling _C.open")
         self.loader_handle = _C.open(
             self.filename, self.device_idx, nccl_communicator, self.buffer_size, 
             self.chunk_size, self.concurrency, self.io_depth, self.backend.value, self.tensor_offsets, self.tensor_keep)
         self.open_seconds = time.perf_counter() - open_started_at
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] _open: _C.open returned in {self.open_seconds:.3f}s")
 
     def __enter__(self) -> 'safe_open':
         if self.loader_handle is None:
@@ -1074,22 +1092,53 @@ class safe_open:
         max_oversize = max(
             self.tensor_sizes[i] for i in self._host_fallback_indices)
         # All ranks map ONE shared block (the same physical segment), so its name
-        # must be identical across processes. Derive a token from rank 0 and
-        # broadcast it; os.getpid() would differ across workers and cannot be used.
+        # must be identical across processes. A cross-rank collective to agree on
+        # a random name (dist.broadcast_object_list followed by a barrier) proved
+        # to deadlock in the vLLM NCCL worker process-group context: the source
+        # rank completes its send and moves on while the receiver stays blocked in
+        # the broadcast, so the ranks diverge into different NCCL operations. The
+        # shm name is therefore derived deterministically from loader content that
+        # is guaranteed identical on every rank (sorted filenames + total tensor
+        # bytes + world size), requiring no communication at all.
         group = self.process_group if self.process_group is not None else None
         if getattr(self, "_oversize_shm_token", None) is None:
-            token = os.urandom(8).hex() if self.rank == 0 else None
-            if group is not None and self.world_size > 1:
-                token_list = [token]
-                dist.broadcast_object_list(token_list, src=0, group=group)
-                token = token_list[0]
-            else:
-                token = "single"
-            self._oversize_shm_token = token
+            digest = hashlib.sha256()
+            for filename in self.filename:
+                digest.update(os.path.abspath(filename).encode("utf-8"))
+            digest.update(str(self.total_tensor_size).encode("ascii"))
+            digest.update(str(self.world_size).encode("ascii"))
+            # 16 hex chars keeps the name short; collision with a stale block from
+            # a crashed prior session is handled below by unlinking before create.
+            self._oversize_shm_token = digest.hexdigest()[:16]
         shm_name = f"instanttensor_{self._oversize_shm_token}_oversize"
+        # Reserve marker bytes after the tensor area to implement two host-level
+        # (NCCL-free) barriers in the same shared block, replacing the `dist.barrier`
+        # calls in tensors() that deadlocked in the vLLM worker group on this host
+        # (see _rank_slice note). Two marker sets of world_size bytes each are used:
+        #   write-markers   : monotonic per-rank count of fully-written slices
+        #   consume-markers : monotonic per-rank count of fully-consumed tensors
+        # The consume barrier guarantees no rank overwrites the shared block with
+        # the next oversize tensor until every rank has finished reading the
+        # current one, preventing shared-buffer reuse corruption. Both areas are
+        # beyond max_oversize, so tensor data never overlaps the markers.
+        marker_area = (2 * self.world_size) if self.world_size > 1 else 0
+        shm_size = max_oversize + marker_area
+        debug_log("oversize shared block %s = %d B (tensor + %d markers)",
+                  shm_name, shm_size, marker_area)
         # Rank 0 creates; other ranks wait/retry until it exists, then they open.
         if self.rank == 0:
-            shm = shared_memory.SharedMemory(create=True, size=max_oversize,
+            # A block with the same deterministic name can be left over from a
+            # crashed/forced-killed session. Drop it before creating so a fresh
+            # load does not fail with FileExistsError. Within a live session only
+            # rank 0 creates/unlinks, so this cannot clobber a peer's segment.
+            try:
+                stale = shared_memory.SharedMemory(create=False, name=shm_name)
+                stale.close()
+                stale.unlink()
+                debug_log("removed stale oversize shared block %s", shm_name)
+            except FileNotFoundError:
+                pass
+            shm = shared_memory.SharedMemory(create=True, size=shm_size,
                                              name=shm_name)
             self._oversize_shm = shm
         else:
@@ -1104,13 +1153,79 @@ class safe_open:
                 raise RuntimeError(
                     f"rank {self.rank} timed out opening shared-memory block "
                     f"{shm_name} for host-fallback tensors")
-        # All ranks map it before any rank streams a slice.
-        if group is not None and self.world_size > 1:
-            dist.barrier(group)
+        self._oversize_barrier_base = max_oversize
+        self._oversize_consume_base = max_oversize + self.world_size
         self._oversize_shm_tensor = torch.frombuffer(
             self._oversize_shm.buf, dtype=torch.uint8)
-        debug_log("oversize shared block %s = %d B", shm_name, max_oversize)
         return self._oversize_shm_tensor
+
+    def _oversize_signal_done(self):
+        """Record that this rank has fully written the current oversize tensor's
+        slice into the shared block. Uses a monotonic per-rank byte counter that is
+        never reset, so peers cannot clear it (a race that would deadlock a boolean
+        reset barrier). No CUDA/NCCL collective is involved."""
+        self._oversize_step += 1
+        if self.world_size <= 1:
+            return
+        self._oversize_shm.buf[self._oversize_barrier_base + self.rank] = (
+            self._oversize_step & 0xFF)
+
+    def _oversize_wait_all(self):
+        """Spin until every rank has published that it wrote the current oversize
+        tensor (its write-marker >= this rank's current write step). This is a
+        host-only barrier in shared memory, replacing `dist.barrier(pg)` which
+        deadlocked in the vLLM worker group on this host. Counters are monotonic
+        (only ever increased), so once a rank observes all peers >= its target it
+        can proceed and no rank can be stalled by a peer's marker being cleared."""
+        if self.world_size <= 1:
+            return
+        base = self._oversize_barrier_base
+        buf = self._oversize_shm.buf
+        target = self._oversize_step
+        while True:
+            all_ready = True
+            for r in range(self.world_size):
+                if (buf[base + r] & 0xFF) < target:
+                    all_ready = False
+                    break
+            if all_ready:
+                break
+            time.sleep(0.0005)
+
+    def _oversize_signal_consumed(self):
+        """Record that this rank has finished reading (consuming) the previous
+        oversize tensor from the shared block, so the block may be safely reused
+        for the next one. Called after the generator resumes past a yield, when
+        vLLM has returned from loading that tensor's weights."""
+        self._oversize_consume_step += 1
+        if self.world_size <= 1:
+            return
+        self._oversize_shm.buf[
+            self._oversize_consume_base + self.rank] = (
+                self._oversize_consume_step & 0xFF)
+
+    def _oversize_wait_consumed(self):
+        """Spin until every rank has consumed the previously-yielded oversize
+        tensor. This is the second half of the per-tensor lifecycle barrier: it
+        runs before a rank streams the next oversize tensor, preventing it from
+        overwriting the shared block while a peer is still reading the current
+        tensor. Host-only, monotonic counters, so it is deadlock-free as long as
+        every rank consumes its yielded tensors (which vLLM does before asking for
+        the next one)."""
+        if self.world_size <= 1:
+            return
+        base = self._oversize_consume_base
+        buf = self._oversize_shm.buf
+        target = self._oversize_consume_step
+        while True:
+            all_ready = True
+            for r in range(self.world_size):
+                if (buf[base + r] & 0xFF) < target:
+                    all_ready = False
+                    break
+            if all_ready:
+                break
+            time.sleep(0.0005)
 
     def _release_oversize_shm(self):
         if self._oversize_shm is None:
@@ -1179,6 +1294,7 @@ class safe_open:
         if self.iterated:
             raise RuntimeError("tensors() can only be called once")
         self.iterated = True
+        debug_log(f"[DGN rank={self.rank} pid={os.getpid()}] tensors(): starting iteration over {len(self.ordered_tensor_metadatas)} tensors")
         for tensor_index, (name, metadata) in enumerate(self.ordered_tensor_metadatas):
             stream = torch.cuda.current_stream()
             stream.synchronize()
@@ -1199,14 +1315,35 @@ class safe_open:
                 # memory) and placing shards on GPU. This keeps the staging buffer
                 # bounded and never holds the whole tensor in GPU RAM.
                 f_idx, file_offset = self._tensor_host_sources[tensor_index]
+                debug_log(f"[rank={self.rank} pid={os.getpid()}] oversize tensor#{tensor_index} ({name}) size={tensor_size}: entering _ensure_oversize_shm")
                 src = self._ensure_oversize_shm()
+                # The shared block is reused for every oversize tensor, so before a
+                # rank streams this tensor into it we must be sure no rank is still
+                # reading the previously-yielded oversize tensor from the block. The
+                # generator resumes here only after vLLM has returned from loading
+                # the previous tensor, so this rank is done consuming it; we publish
+                # that and wait for every peer to do the same.
+                if self._oversize_seen:
+                    self._oversize_signal_consumed()
+                    self._oversize_wait_consumed()
+                    debug_log(f"[rank={self.rank} pid={os.getpid()}] oversize tensor#{tensor_index}: block released (consume_step={self._oversize_consume_step})")
                 slice_start, slice_size = self._rank_slice(tensor_size)
+                debug_log(f"[rank={self.rank} pid={os.getpid()}] oversize tensor#{tensor_index}: slice_start={slice_start} slice_size={slice_size} calling _C.stream_tensor (f_idx={f_idx} file_offset={file_offset})")
                 _C.stream_tensor(
                     self.loader_handle, f_idx, file_offset, slice_start,
                     slice_size, src.data_ptr(), tensor_size,
                 )
-                if self.process_group is not None and self.world_size > 1:
-                    dist.barrier(self.process_group)
+                self._oversize_seen = True
+                debug_log(f"[rank={self.rank} pid={os.getpid()}] oversize tensor#{tensor_index}: _C.stream_tensor returned")
+                # Ranks can stream and consume at slightly different rates, so once
+                # this rank has written its slice we (1) publish a shared-memory
+                # write-marker and (2) wait until every rank has published one,
+                # guaranteeing the full tensor is materialized before any rank reads
+                # a peer slice. This deliberately replaces `dist.barrier(pg)`, which
+                # deadlocked in the vLLM NCCL worker group on this host.
+                self._oversize_signal_done()
+                self._oversize_wait_all()
+                debug_log(f"[rank={self.rank} pid={os.getpid()}] oversize tensor#{tensor_index}: write barrier passed (step={self._oversize_step})")
                 tensor = src[:tensor_size].view(torch_dtype).view(torch.Size(shape))
                 self.yielded_bytes += tensor_size
                 yield name, tensor
